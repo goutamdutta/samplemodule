@@ -1,5 +1,6 @@
 
 from fastapi import FastAPI, HTTPException
+from fastapi import UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import os
@@ -9,6 +10,9 @@ from pathlib import Path
 from bs4 import BeautifulSoup
 from urllib.parse import urljoin, urlparse, urldefrag
 from typing import Optional
+from io import BytesIO
+import tempfile
+import subprocess
 
 # Ensure we load the .env that sits next to this file
 load_dotenv(dotenv_path=Path(__file__).with_name('.env'))
@@ -159,3 +163,96 @@ async def crawl(req: CrawlRequest):
                 continue
 
     return {"count": len(results), "pages": [r.model_dump() for r in results]}
+
+
+def _extract_text_from_txt(data: bytes) -> str:
+    try:
+        return data.decode('utf-8', errors='ignore')
+    except Exception:
+        return ""
+
+
+def _extract_text_from_pdf(data: bytes) -> str:
+    try:
+        from pypdf import PdfReader
+        reader = PdfReader(BytesIO(data))
+        texts: list[str] = []
+        for page in reader.pages:
+            try:
+                texts.append(page.extract_text() or "")
+            except Exception:
+                continue
+        return "\n".join(t.strip() for t in texts if t)
+    except Exception as e:
+        return ""
+
+
+def _extract_text_from_docx(data: bytes) -> str:
+    try:
+        import docx  # python-docx
+        document = docx.Document(BytesIO(data))
+        paragraphs = [p.text for p in document.paragraphs if p.text]
+        return "\n".join(paragraphs)
+    except Exception:
+        return ""
+
+
+def _extract_text_from_doc(data: bytes) -> str:
+    # Uses system 'antiword' to convert .doc to text
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".doc", delete=True) as tmp:
+            tmp.write(data)
+            tmp.flush()
+            proc = subprocess.run(["antiword", tmp.name], capture_output=True, check=False)
+            if proc.returncode == 0 and proc.stdout:
+                return proc.stdout.decode('utf-8', errors='ignore')
+            # Fallback: try latin-1
+            if proc.stdout:
+                return proc.stdout.decode('latin-1', errors='ignore')
+            return ""
+    except FileNotFoundError:
+        # antiword not installed
+        return ""
+    except Exception:
+        return ""
+
+
+@app.post("/api/extract-text")
+async def extract_text(file: UploadFile | None = File(None), files: list[UploadFile] | None = File(None)):
+    uploads: list[UploadFile] = []
+    if file is not None:
+        uploads.append(file)
+    if files:
+        uploads.extend(files)
+    if not uploads:
+        raise HTTPException(status_code=400, detail="No file(s) provided. Use 'file' or 'files'.")
+
+    results: list[dict] = []
+    for up in uploads:
+        try:
+            name = up.filename or "upload"
+            ext = Path(name).suffix.lower()
+            data = await up.read()
+            text = ""
+            if ext == ".txt":
+                text = _extract_text_from_txt(data)
+            elif ext == ".pdf":
+                text = _extract_text_from_pdf(data)
+            elif ext == ".docx":
+                text = _extract_text_from_docx(data)
+            elif ext == ".doc":
+                text = _extract_text_from_doc(data)
+            else:
+                results.append({"filename": name, "supported": False, "error": f"Unsupported extension: {ext}"})
+                continue
+
+            results.append({
+                "filename": name,
+                "supported": True,
+                "characters": len(text),
+                "text": text
+            })
+        except Exception as e:
+            results.append({"filename": getattr(up, 'filename', 'upload'), "supported": False, "error": str(e)})
+
+    return {"count": len(results), "results": results}
