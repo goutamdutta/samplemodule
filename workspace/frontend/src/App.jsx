@@ -6,6 +6,9 @@ function App() {
   const [input, setInput] = useState('')
   const [loading, setLoading] = useState(false)
   const listRef = useRef(null)
+  const [crawlUrl, setCrawlUrl] = useState('https://example.com')
+  const [crawlBusy, setCrawlBusy] = useState(false)
+  const [crawlResult, setCrawlResult] = useState(null)
 
   useEffect(() => {
     if (listRef.current) {
@@ -39,8 +42,54 @@ function App() {
   }
 
   return (
-    <div style={{ maxWidth: 800, margin: '0 auto', padding: 16 }}>
+    <div style={{ maxWidth: 980, margin: '0 auto', padding: 16 }}>
       <h1>Groq Chatbot</h1>
+      <section style={{ marginBottom: 24, padding: 12, border: '1px solid #eee', borderRadius: 8 }}>
+        <h2 style={{ marginTop: 0 }}>Website Crawler</h2>
+        <form onSubmit={async (e) => {
+          e.preventDefault()
+          if (!crawlUrl) return
+          setCrawlBusy(true)
+          setCrawlResult(null)
+          try {
+            const res = await fetch('/api/crawl', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ start_url: crawlUrl, max_pages: 20 }),
+            })
+            if (!res.ok) throw new Error(await res.text())
+            const data = await res.json()
+            setCrawlResult(data)
+          } catch (err) {
+            setCrawlResult({ error: String(err) })
+          } finally {
+            setCrawlBusy(false)
+          }
+        }} style={{ display: 'flex', gap: 8 }}>
+          <input value={crawlUrl} onChange={(e) => setCrawlUrl(e.target.value)} placeholder="https://your-site.com" style={{ flex: 1, padding: 10, borderRadius: 8, border: '1px solid #e5e7eb' }} />
+          <button type="submit" disabled={crawlBusy} style={{ padding: '10px 16px', borderRadius: 8 }}>
+            {crawlBusy ? 'Crawling…' : 'Crawl'}
+          </button>
+        </form>
+        {crawlResult && (
+          <div style={{ marginTop: 12, maxHeight: 240, overflow: 'auto', border: '1px solid #eee', borderRadius: 8, padding: 8, background: '#fafafa' }}>
+            {crawlResult.error ? (
+              <div style={{ color: 'red' }}>{crawlResult.error}</div>
+            ) : (
+              <div>
+                <div style={{ marginBottom: 8 }}>Pages: {crawlResult.count}</div>
+                <ul style={{ paddingLeft: 16 }}>
+                  {crawlResult.pages?.map((p, i) => (
+                    <li key={i}>
+                      <a href={p.url} target="_blank" rel="noreferrer">{p.title || p.url}</a> <span style={{ color: '#6b7280' }}>({p.status} {p.content_type})</span>
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            )}
+          </div>
+        )}
+      </section>
       <div ref={listRef} style={{ height: 400, overflowY: 'auto', border: '1px solid #eee', borderRadius: 8, padding: 12, background: '#fafafa' }}>
         {messages.filter(m => m.role !== 'system').map((m, i) => (
           <div key={i} style={{ marginBottom: 12, display: 'flex', justifyContent: m.role === 'user' ? 'flex-end' : 'flex-start' }}>

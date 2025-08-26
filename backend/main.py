@@ -6,6 +6,9 @@ import os
 import httpx
 from dotenv import load_dotenv
 from pathlib import Path
+from bs4 import BeautifulSoup
+from urllib.parse import urljoin, urlparse, urldefrag
+from typing import Optional
 
 # Ensure we load the .env that sits next to this file
 load_dotenv(dotenv_path=Path(__file__).with_name('.env'))
@@ -34,6 +37,21 @@ class ChatRequest(BaseModel):
     model: str = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
     temperature: float | None = 0.7
     max_tokens: int | None = 512
+
+
+class CrawlRequest(BaseModel):
+    start_url: str
+    max_pages: int = 50
+    same_domain_only: bool = True
+    timeout_seconds: int = 15
+    user_agent: Optional[str] = "GroqChatbotCrawler/1.0 (+https://example.local)"
+
+class CrawledPage(BaseModel):
+    url: str
+    title: str | None = None
+    status: int | None = None
+    num_links: int = 0
+    content_type: str | None = None
 
 @app.get("/health")
 async def health():
@@ -66,3 +84,78 @@ async def chat(req: ChatRequest):
         raise HTTPException(status_code=e.response.status_code, detail=e.response.text)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+def _normalize_link(base_url: str, href: str) -> Optional[str]:
+    if not href:
+        return None
+    href = href.strip()
+    # Drop mailto:, javascript:, tel: etc.
+    if any(href.lower().startswith(s) for s in ("mailto:", "javascript:", "tel:", "data:")):
+        return None
+    absolute = urljoin(base_url, href)
+    # Remove fragment
+    absolute, _ = urldefrag(absolute)
+    parsed = urlparse(absolute)
+    if parsed.scheme not in ("http", "https"):
+        return None
+    return absolute
+
+
+@app.post("/api/crawl")
+async def crawl(req: CrawlRequest):
+    start = req.start_url
+    parsed_start = urlparse(start)
+    if parsed_start.scheme not in ("http", "https"):
+        raise HTTPException(status_code=400, detail="start_url must be http or https")
+
+    to_visit: list[str] = [start]
+    visited: set[str] = set()
+    results: list[CrawledPage] = []
+
+    headers = {"User-Agent": req.user_agent or "GroqChatbotCrawler/1.0"}
+    timeout = httpx.Timeout(req.timeout_seconds)
+
+    async with httpx.AsyncClient(headers=headers, timeout=timeout, follow_redirects=True) as client:
+        while to_visit and len(visited) < req.max_pages:
+            url = to_visit.pop(0)
+            if url in visited:
+                continue
+            visited.add(url)
+
+            try:
+                resp = await client.get(url)
+                content_type = resp.headers.get("Content-Type", "")
+                is_html = content_type.startswith("text/html") or "html" in content_type
+                title = None
+                num_links = 0
+
+                if is_html:
+                    soup = BeautifulSoup(resp.text, "lxml")
+                    title_tag = soup.find("title")
+                    title = title_tag.text.strip() if title_tag else None
+                    # Extract links
+                    domain = parsed_start.netloc
+                    for a in soup.find_all("a"):
+                        href = a.get("href")
+                        normalized = _normalize_link(url, href)
+                        if not normalized:
+                            continue
+                        if req.same_domain_only and urlparse(normalized).netloc != domain:
+                            continue
+                        if normalized not in visited and normalized not in to_visit and len(visited) + len(to_visit) < req.max_pages:
+                            to_visit.append(normalized)
+                            num_links += 1
+
+                results.append(CrawledPage(
+                    url=url,
+                    title=title,
+                    status=resp.status_code,
+                    num_links=num_links,
+                    content_type=content_type if content_type else None
+                ))
+            except httpx.HTTPError as e:
+                results.append(CrawledPage(url=url, title=None, status=None, num_links=0, content_type=None))
+                continue
+
+    return {"count": len(results), "pages": [r.model_dump() for r in results]}
